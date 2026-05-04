@@ -8,7 +8,7 @@ from PIL import Image
 from sentence_transformers import SentenceTransformer
 
 _OUTPUTS = os.path.join(os.path.dirname(__file__), "..", "outputs")
-_SIMILARITY_THRESHOLD = 0.9
+_SIMILARITY_THRESHOLD = 0.85
 _TOP_N = 500
 
 
@@ -57,16 +57,29 @@ def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-9))
 
 
+def compute_title_similarity(title1: str, title2: str) -> float:
+    words1 = set(title1.lower().split())
+    words2 = set(title2.lower().split())
+    common = words1 & words2
+    total = words1 | words2
+    return len(common) / len(total) if total else 0.0
+
+
+def _final_score(img_sim: float, title_sim: float) -> float:
+    return 0.7 * img_sim + 0.3 * title_sim
+
+
 def cluster_by_similarity(embeddings: list, valid_idx: list, df: pd.DataFrame) -> list[dict]:
-    """Greedy clustering: assign each item to the first cluster it's similar to."""
+    """Greedy clustering using combined image + title similarity."""
     clusters = []
     assigned = set()
 
     for i, (emb_i, idx_i) in enumerate(zip(embeddings, valid_idx)):
         if i in assigned:
             continue
+        title_i = df.at[idx_i, "title"]
         cluster_items = [{
-            "title": df.at[idx_i, "title"],
+            "title": title_i,
             "store": df.at[idx_i, "store_name"],
             "image_url": df.at[idx_i, "image_url"],
         }]
@@ -74,11 +87,16 @@ def cluster_by_similarity(embeddings: list, valid_idx: list, df: pd.DataFrame) -
         for j, (emb_j, idx_j) in enumerate(zip(embeddings, valid_idx)):
             if j in assigned:
                 continue
-            if _cosine_similarity(emb_i, emb_j) >= _SIMILARITY_THRESHOLD:
+            title_j = df.at[idx_j, "title"]
+            img_sim = _cosine_similarity(emb_i, emb_j)
+            title_sim = compute_title_similarity(title_i, title_j)
+            score = _final_score(img_sim, title_sim)
+            if score >= _SIMILARITY_THRESHOLD:
                 cluster_items.append({
-                    "title": df.at[idx_j, "title"],
+                    "title": title_j,
                     "store": df.at[idx_j, "store_name"],
                     "image_url": df.at[idx_j, "image_url"],
+                    "similarity_score": round(score, 3),
                 })
                 assigned.add(j)
         clusters.append(cluster_items)
@@ -123,7 +141,11 @@ def run():
     if multi_store:
         print("\nSample multi-store cluster:")
         for item in multi_store[0][:5]:
-            print(f"  [{item['store']}] {item['title'][:80]}")
+            score_str = f"  score={item['similarity_score']}" if "similarity_score" in item else ""
+            print(f"  Store:  {item['store']}")
+            print(f"  Title:  {item['title'][:90]}")
+            print(f"  Image:  {item['image_url']}{score_str}")
+            print()
 
     print(f"\nSaved to {output_path}")
 
