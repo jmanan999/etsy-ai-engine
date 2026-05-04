@@ -1,9 +1,39 @@
 import json
 import os
+import re
 
 import pandas as pd
 
 _OUTPUTS = os.path.join(os.path.dirname(__file__), "..", "outputs")
+
+_STOPWORDS = {
+    "a", "an", "the", "and", "or", "for", "of", "in", "to", "with",
+    "by", "on", "is", "it", "its", "be", "as", "at", "this", "that",
+    "from", "are", "was", "but", "not", "so", "my", "your",
+}
+
+_POWER_WORDS = ["gift", "handmade", "gold", "minimalist", "silver", "brass",
+                "boho", "vintage", "statement", "adjustable", "personalized",
+                "unique", "custom", "birthday", "wedding", "anniversary"]
+
+
+def _extract_features(title: str) -> dict:
+    words = re.findall(r"[a-z]{3,}", title.lower())
+    filtered = [w for w in words if w not in _STOPWORDS]
+    # top keywords by position (earlier = more prominent in listing)
+    seen, keywords = set(), []
+    for w in filtered:
+        if w not in seen:
+            seen.add(w)
+            keywords.append(w)
+        if len(keywords) == 5:
+            break
+    power_hits = [w for w in _POWER_WORDS if w in title.lower()]
+    return {
+        "keywords": keywords,
+        "word_count": len(title.split()),
+        "power_words": power_hits,
+    }
 
 
 def load_data() -> tuple[list, pd.DataFrame]:
@@ -43,40 +73,57 @@ def _generate_insights(items_with_data: list[dict]) -> list[str]:
     best = ranked[0]
     worst = ranked[-1]
 
-    stores = [i["store"] for i in items_with_data]
     prices = [i["price"] for i in items_with_data]
     quantities = [i["quantity"] for i in items_with_data]
-
     price_spread = max(prices) - min(prices)
-    qty_spread = max(quantities) - min(quantities) if len(quantities) > 1 else 0
 
-    # Dominance
-    if len(stores) > 1 and best["quantity"] >= 2 * (quantities[1] if len(quantities) > 1 else 1):
-        insights.append(f"'{best['store']}' dominates this product with {best['quantity']:.0f} units sold.")
+    # --- Dominance ---
+    runner_up_qty = quantities[1] if len(quantities) > 1 else 1
+    if best["quantity"] >= 2 * runner_up_qty:
+        insights.append(f"'{best['store']}' dominates — {best['quantity']:.0f} units vs {runner_up_qty:.0f} for runner-up.")
 
-    # Pricing vs performance
+    # --- Pricing vs performance ---
     if len(items_with_data) >= 2 and price_spread > 2:
         if best["price"] < worst["price"]:
             insights.append("Lower-priced listing outperforms — price sensitivity is high for this product.")
         elif best["price"] > worst["price"]:
             insights.append("Higher-priced listing wins — premium positioning is working here.")
 
-    # Pricing spread
+    # --- Pricing spread ---
     if price_spread <= 2:
-        insights.append("All stores use similar pricing — little competitive differentiation on price.")
+        insights.append("All stores use near-identical pricing — compete on title/image, not price.")
     elif price_spread >= 10:
-        insights.append(f"Wide price spread (${min(prices):.0f}–${max(prices):.0f}) — pricing strategy varies significantly.")
+        insights.append(f"Wide price spread (${min(prices):.0f}–${max(prices):.0f}) — big opportunity to find the optimal price point.")
 
-    # Multi-store competition
-    if len(stores) >= 4:
-        insights.append(f"High competition — {len(stores)} stores selling this product.")
-    elif len(stores) == 2:
-        insights.append("Direct head-to-head competition between 2 stores.")
+    # --- Title feature comparison ---
+    best_wc = best["word_count"]
+    avg_wc = sum(i["word_count"] for i in items_with_data) / len(items_with_data)
+    if best_wc > avg_wc * 1.2:
+        insights.append(f"Winning title is more descriptive ({best_wc} words vs avg {avg_wc:.0f}) — detail likely helps SEO.")
+    elif best_wc < avg_wc * 0.8:
+        insights.append(f"Winning title is shorter ({best_wc} words vs avg {avg_wc:.0f}) — concise titles may convert better here.")
 
-    # Volume signal
+    # --- Power word advantage ---
+    best_power = set(best.get("power_words", []))
+    others_power = set(w for i in ranked[1:] for w in i.get("power_words", []))
+    exclusive = best_power - others_power
+    if exclusive:
+        insights.append(f"Winning listing exclusively uses: {', '.join(exclusive)} — consider adding these keywords.")
+
+    if "gift" in best_power and "gift" not in others_power:
+        insights.append("'gift' keyword in winning title — gifting positioning drives sales for this product.")
+
+    # --- Competition level ---
+    n = len(items_with_data)
+    if n >= 4:
+        insights.append(f"High competition — {n} stores selling this product.")
+    elif n == 2:
+        insights.append("Direct head-to-head — only 2 stores in this cluster.")
+
+    # --- Volume signal ---
     total_qty = sum(quantities)
     if total_qty >= 500:
-        insights.append(f"High demand product — {total_qty:.0f} combined units across stores.")
+        insights.append(f"High demand — {total_qty:.0f} combined units, strong market signal.")
 
     return insights if insights else ["Insufficient data for actionable insight."]
 
@@ -95,25 +142,35 @@ def analyze_clusters(clusters: list, agg: pd.DataFrame) -> list[dict]:
             match = _lookup(item["title"], agg)
             if match:
                 qty, price = match
+                feats = _extract_features(item["title"])
                 items_with_data.append({
                     "store": item["store"],
                     "title": item["title"],
                     "quantity": qty,
                     "price": price,
                     "image_url": item["image_url"],
+                    "keywords": feats["keywords"],
+                    "word_count": feats["word_count"],
+                    "power_words": feats["power_words"],
                 })
 
         if not items_with_data:
             continue
 
+        max_qty = max(i["quantity"] for i in items_with_data)
+        for item in items_with_data:
+            item["relative_score"] = round(item["quantity"] / max_qty, 3)
+
         ranked = sorted(items_with_data, key=lambda x: x["quantity"], reverse=True)
         prices = [i["price"] for i in items_with_data]
         total_qty = sum(i["quantity"] for i in items_with_data)
+        num_unique_images = len({i["image_url"] for i in items})
 
         results.append({
             "cluster_id": cluster["cluster_id"],
             "num_stores": len(stores),
             "stores": stores,
+            "num_unique_images": num_unique_images,
             "best_store": ranked[0]["store"],
             "best_title": ranked[0]["title"],
             "best_quantity": round(ranked[0]["quantity"], 1),
