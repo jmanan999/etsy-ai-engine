@@ -29,6 +29,7 @@ def load_data() -> pd.DataFrame:
 
 def _load_image(url: str):
     try:
+        url = url.replace("il_75x75", "il_794x794")
         r = requests.get(url, timeout=10)
         r.raise_for_status()
         from io import BytesIO
