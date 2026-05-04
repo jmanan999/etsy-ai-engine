@@ -22,9 +22,8 @@ def load_data() -> pd.DataFrame:
     df = cleaned.merge(images, on="transaction_id", how="inner")
     df = df.dropna(subset=["image_url", "title", "store_name"])
 
-    # One image per unique title — pick the first occurrence
-    df = df.drop_duplicates(subset=["title"]).reset_index(drop=True)
-    print(f"Unique titled products with images: {len(df)}")
+    df = df.reset_index(drop=True)
+    print(f"Products with images: {len(df)}")
     return df
 
 
@@ -65,41 +64,59 @@ def compute_title_similarity(title1: str, title2: str) -> float:
     return len(common) / len(total) if total else 0.0
 
 
-def _final_score(img_sim: float, title_sim: float) -> float:
-    return 0.7 * img_sim + 0.3 * title_sim
+def _matches(emb_i: np.ndarray, title_i: str, emb_j: np.ndarray, title_j: str) -> tuple[bool, float, float, str]:
+    """Return (is_match, img_sim, title_sim, condition_label)."""
+    img_sim = _cosine_similarity(emb_i, emb_j)
+    title_sim = compute_title_similarity(title_i, title_j)
+    if img_sim >= 0.85:
+        return True, img_sim, title_sim, "STRONG_IMAGE"
+    if img_sim >= 0.75 and title_sim >= 0.4:
+        return True, img_sim, title_sim, "HYBRID_MATCH"
+    return False, img_sim, title_sim, ""
 
 
 def cluster_by_similarity(embeddings: list, valid_idx: list, df: pd.DataFrame) -> list[dict]:
-    """Greedy clustering using combined image + title similarity."""
-    clusters = []
+    """Greedy clustering with cluster-wide comparison (chain similarity)."""
+    clusters = []        # list of list-of-items
+    cluster_embs = []    # list of list-of-embeddings (parallel to clusters)
     assigned = set()
 
     for i, (emb_i, idx_i) in enumerate(zip(embeddings, valid_idx)):
         if i in assigned:
             continue
         title_i = df.at[idx_i, "title"]
-        cluster_items = [{
+        new_cluster = [{
             "title": title_i,
             "store": df.at[idx_i, "store_name"],
             "image_url": df.at[idx_i, "image_url"],
         }]
+        new_embs = [emb_i]
         assigned.add(i)
+
         for j, (emb_j, idx_j) in enumerate(zip(embeddings, valid_idx)):
             if j in assigned:
                 continue
             title_j = df.at[idx_j, "title"]
-            img_sim = _cosine_similarity(emb_i, emb_j)
-            title_sim = compute_title_similarity(title_i, title_j)
-            score = _final_score(img_sim, title_sim)
-            if score >= _SIMILARITY_THRESHOLD:
-                cluster_items.append({
-                    "title": title_j,
-                    "store": df.at[idx_j, "store_name"],
-                    "image_url": df.at[idx_j, "image_url"],
-                    "similarity_score": round(score, 3),
-                })
-                assigned.add(j)
-        clusters.append(cluster_items)
+            # Compare j against every item already in the cluster
+            for emb_k, item_k in zip(new_embs, new_cluster):
+                matched, img_sim, title_sim, condition = _matches(
+                    emb_k, item_k["title"], emb_j, title_j
+                )
+                if matched:
+                    new_cluster.append({
+                        "title": title_j,
+                        "store": df.at[idx_j, "store_name"],
+                        "image_url": df.at[idx_j, "image_url"],
+                        "img_sim": round(img_sim, 3),
+                        "title_sim": round(title_sim, 3),
+                        "condition": condition,
+                    })
+                    new_embs.append(emb_j)
+                    assigned.add(j)
+                    break
+
+        clusters.append(new_cluster)
+        cluster_embs.append(new_embs)
 
     return clusters
 
@@ -141,10 +158,11 @@ def run():
     if multi_store:
         print("\nSample multi-store cluster:")
         for item in multi_store[0][:5]:
-            score_str = f"  score={item['similarity_score']}" if "similarity_score" in item else ""
-            print(f"  Store:  {item['store']}")
-            print(f"  Title:  {item['title'][:90]}")
-            print(f"  Image:  {item['image_url']}{score_str}")
+            print(f"  Store:     {item['store']}")
+            print(f"  Title:     {item['title'][:90]}")
+            print(f"  Image:     {item['image_url']}")
+            if "condition" in item:
+                print(f"  img_sim={item['img_sim']}  title_sim={item['title_sim']}  [{item['condition']}]")
             print()
 
     print(f"\nSaved to {output_path}")
