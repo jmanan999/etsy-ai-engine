@@ -16,13 +16,19 @@ def load_aggregated_data(file_path: str) -> pd.DataFrame:
     return pd.read_csv(file_path)
 
 
+_TOP_N_PRODUCTS = 300
+
+
 def _tokenize(title: str) -> list[str]:
-    words = re.findall(r"[a-z]+", title.lower())
-    return [w for w in words if w not in _STOPWORDS and len(w) > 1]
+    # Only alphabetic words, length >= 3, not stopwords
+    words = re.findall(r"[a-z]{3,}", title.lower())
+    return [w for w in words if w not in _STOPWORDS]
 
 
 def extract_keywords(df: pd.DataFrame, top_n: int = 50) -> list[tuple[str, int]]:
-    top = df.sort_values("total_quantity", ascending=False).head(50)
+    print(f"Total products in dataset: {len(df)}")
+    top = df.sort_values("total_quantity", ascending=False).head(_TOP_N_PRODUCTS)
+    print(f"Products used for analysis: {len(top)}")
     counts: Counter = Counter()
     for title in top["title"]:
         counts.update(_tokenize(str(title)))
@@ -30,7 +36,7 @@ def extract_keywords(df: pd.DataFrame, top_n: int = 50) -> list[tuple[str, int]]
 
 
 def extract_bigrams(df: pd.DataFrame, top_n: int = 30) -> list[tuple[str, int]]:
-    top = df.sort_values("total_quantity", ascending=False).head(50)
+    top = df.sort_values("total_quantity", ascending=False).head(_TOP_N_PRODUCTS)
     counts: Counter = Counter()
     for title in top["title"]:
         words = _tokenize(str(title))
