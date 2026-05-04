@@ -1,11 +1,15 @@
 import json
 import os
+import time
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pandas as pd
 import requests
 from PIL import Image
 from sentence_transformers import SentenceTransformer
+
+_embedding_cache: dict[str, np.ndarray] = {}
 
 _OUTPUTS = os.path.join(os.path.dirname(__file__), "..", "outputs")
 _SIMILARITY_THRESHOLD = 0.85
@@ -95,17 +99,37 @@ def _load_image(url: str):
 
 
 def generate_embeddings(df: pd.DataFrame, model: SentenceTransformer) -> tuple[list, list[int]]:
-    """Fetch images and embed them; return (embeddings, valid_indices)."""
-    embeddings, valid_idx = [], []
-    for i, row in df.iterrows():
-        img = _load_image(row["image_url"])
+    """Parallel image fetch + embed with per-URL caching."""
+    cache_hits = 0
+
+    def load_and_embed(args):
+        nonlocal cache_hits
+        idx, row = args
+        url = row["image_url"]
+        if url in _embedding_cache:
+            cache_hits += 1
+            return idx, _embedding_cache[url]
+        img = _load_image(url)
         if img is None:
-            continue
+            return idx, None
         emb = model.encode(img, convert_to_numpy=True)
-        embeddings.append(emb)
-        valid_idx.append(i)
-        if (len(valid_idx)) % 50 == 0:
-            print(f"  Embedded {len(valid_idx)} images...")
+        emb = emb / (np.linalg.norm(emb) + 1e-9)
+        _embedding_cache[url] = emb
+        return idx, emb
+
+    t0 = time.time()
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        results = list(executor.map(load_and_embed, df.iterrows()))
+
+    embeddings, valid_idx = [], []
+    for idx, emb in results:
+        if emb is not None:
+            embeddings.append(emb)
+            valid_idx.append(idx)
+
+    elapsed = round(time.time() - t0, 1)
+    print(f"  Embedded {len(embeddings)} images in {elapsed}s "
+          f"(cache hits: {cache_hits}, new: {len(embeddings) - cache_hits})")
     return embeddings, valid_idx
 
 
@@ -190,7 +214,6 @@ def save_clusters(clusters: list[list], output_path: str) -> None:
 
 
 def run():
-    import time
     start = time.time()
 
     print("Loading data...")
