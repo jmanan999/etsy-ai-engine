@@ -9,7 +9,63 @@ from sentence_transformers import SentenceTransformer
 
 _OUTPUTS = os.path.join(os.path.dirname(__file__), "..", "outputs")
 _SIMILARITY_THRESHOLD = 0.85
-_TOP_N = 500
+_TOP_N = 2000
+
+_CATEGORY_KEYWORDS = {
+    "ring":      ["ring", "band", "signet", "dome", "knuckle", "thumb"],
+    "earring":   ["earring", "earrings", "hoop", "stud", "dangle", "drop", "huggie"],
+    "bracelet":  ["bracelet", "bangle", "anklet", "ankle", "kada", "wristlet"],
+    "necklace":  ["necklace", "pendant", "chain", "choker", "locket", "charm"],
+    "cuff":      ["cuff", "armlet", "arm band", "armband", "upper arm"],
+    "other":     [],
+}
+
+
+def get_category(title: str) -> str:
+    t = title.lower()
+    for category, keywords in _CATEGORY_KEYWORDS.items():
+        if category == "other":
+            continue
+        if any(kw in t for kw in keywords):
+            return category
+    return "other"
+
+
+def get_price_bucket(price: float, low: float, high: float) -> str:
+    if price <= low:
+        return "low"
+    if price <= high:
+        return "medium"
+    return "high"
+
+
+def apply_blocking(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df["category"] = df["title"].apply(get_category)
+
+    low = df["price"].quantile(0.33)
+    high = df["price"].quantile(0.66)
+    df["price_bucket"] = df["price"].apply(lambda p: get_price_bucket(p, low, high))
+
+    print("\n--- Blocking Summary ---")
+    for cat, count in df["category"].value_counts().items():
+        print(f"  Category: {cat:10s} → {count} items")
+    print()
+    for bucket, count in df["price_bucket"].value_counts().items():
+        print(f"  Price bucket: {bucket:6s} → {count} items  (low≤${low:.0f}, med≤${high:.0f}, high>${high:.0f})")
+
+    naive_comparisons = len(df) * (len(df) - 1) // 2
+    blocked_comparisons = sum(
+        len(g) * (len(g) - 1) // 2
+        for _, g in df.groupby(["category", "price_bucket"])
+    )
+    print(f"\n  Naive comparisons:   {naive_comparisons:,}")
+    print(f"  Blocked comparisons: {blocked_comparisons:,}")
+    print(f"  Comparisons avoided: {naive_comparisons - blocked_comparisons:,}  "
+          f"({100*(naive_comparisons-blocked_comparisons)/naive_comparisons:.1f}% reduction)")
+    print("------------------------\n")
+
+    return df
 
 
 def load_data() -> pd.DataFrame:
@@ -134,27 +190,40 @@ def save_clusters(clusters: list[list], output_path: str) -> None:
 
 
 def run():
+    import time
+    start = time.time()
+
     print("Loading data...")
     df = load_data()
     sample = df.head(_TOP_N).reset_index(drop=True)
     print(f"Using top {len(sample)} products for clustering.")
 
-    print("\nLoading CLIP model...")
+    sample = apply_blocking(sample)
+
+    print("Loading CLIP model...")
     model = SentenceTransformer("clip-ViT-B-32")
 
-    print("\nFetching images and generating embeddings...")
-    embeddings, valid_idx = generate_embeddings(sample, model)
-    print(f"Successfully embedded {len(embeddings)} images.")
-
-    print("\nClustering...")
-    clusters = cluster_by_similarity(embeddings, valid_idx, sample)
+    all_clusters = []
+    groups = list(sample.groupby(["category", "price_bucket"]))
+    for (cat, bucket), block in groups:
+        block = block.reset_index(drop=True)
+        print(f"Block [{cat} / {bucket}]: {len(block)} items — embedding...")
+        embeddings, valid_idx = generate_embeddings(block, model)
+        if not embeddings:
+            continue
+        clusters = cluster_by_similarity(embeddings, valid_idx, block)
+        all_clusters.extend(clusters)
+        print(f"  → {len(clusters)} clusters formed.")
 
     output_path = os.path.abspath(os.path.join(_OUTPUTS, "image_clusters.json"))
-    save_clusters(clusters, output_path)
+    save_clusters(all_clusters, output_path)
 
-    multi_store = [c for c in clusters if len(set(i["store"] for i in c)) > 1]
-    print(f"\nTotal clusters: {len(clusters)}")
-    print(f"Clusters with multiple stores: {len(multi_store)}")
+    multi_store = [c for c in all_clusters if len(set(i["store"] for i in c)) > 1]
+    elapsed = round(time.time() - start, 1)
+
+    print(f"\nTotal clusters:            {len(all_clusters)}")
+    print(f"Multi-store clusters:      {len(multi_store)}")
+    print(f"Runtime:                   {elapsed}s")
 
     if multi_store:
         print("\nSample multi-store cluster:")
@@ -166,7 +235,7 @@ def run():
                 print(f"  img_sim={item['img_sim']}  title_sim={item['title_sim']}  [{item['condition']}]")
             print()
 
-    print(f"\nSaved to {output_path}")
+    print(f"Saved to {output_path}")
 
 
 if __name__ == "__main__":
