@@ -129,7 +129,7 @@ def _generate_insights(items_with_data: list[dict]) -> list[str]:
 
 
 def _generate_recommendations(items_with_data: list[dict]) -> list[str]:
-    """Translate cluster patterns into direct seller actions (max 5)."""
+    """Execution-ready tactical instructions derived from cluster data."""
     recs = []
     ranked = sorted(items_with_data, key=lambda x: x["quantity"], reverse=True)
     best = ranked[0]
@@ -138,47 +138,81 @@ def _generate_recommendations(items_with_data: list[dict]) -> list[str]:
     quantities = [i["quantity"] for i in items_with_data]
     price_spread = max(prices) - min(prices)
     word_counts = [i["word_count"] for i in items_with_data]
-    best_power = set(best.get("power_words", []))
-    all_power = set(w for i in items_with_data for w in i.get("power_words", []))
-
-    # --- Pricing recommendation ---
     best_price = best["price"]
-    if price_spread <= 2:
-        recs.append(f"Price around ${best_price:.0f} — all stores are priced similarly; match the market.")
-    elif best["price"] < max(prices):
-        ideal_low = round(min(prices) * 1.05, 0)
-        ideal_high = round(best_price * 1.1, 0)
-        recs.append(f"Price between ${ideal_low:.0f}–${ideal_high:.0f} — lower pricing correlates with higher sales here.")
-    else:
-        recs.append(f"You can price at ${best_price:.0f}+ — premium pricing works for this product.")
-
-    # --- Title keyword recommendation ---
-    missing_power = [w for w in ["gift", "handmade", "gold", "minimalist"] if w in all_power and w not in best_power]
-    exclusive_power = list(best_power - set(w for i in ranked[1:] for w in i.get("power_words", [])))
-    if exclusive_power:
-        recs.append(f"Include '{', '.join(exclusive_power[:3])}' in your title — unique to the best-performing listing.")
-    if missing_power:
-        recs.append(f"Consider adding '{', '.join(missing_power[:2])}' — used by competitors but not by the top seller.")
-
-    # --- Title length recommendation ---
     best_wc = best["word_count"]
     avg_wc = round(sum(word_counts) / len(word_counts))
-    lo_wc = min(word_counts)
-    hi_wc = max(word_counts)
-    if best_wc >= avg_wc:
-        recs.append(f"Aim for {best_wc}–{hi_wc} words in your title — longer, more descriptive titles lead here.")
-    else:
-        recs.append(f"Keep title concise: {lo_wc}–{best_wc} words — the winning listing is shorter than average.")
-
-    # --- Positioning / competition strategy ---
+    best_power = set(best.get("power_words", []))
+    all_power = set(w for i in items_with_data for w in i.get("power_words", []))
     n = len(items_with_data)
     total_qty = sum(quantities)
-    if n >= 4 and total_qty >= 500:
-        recs.append(f"High-demand, high-competition product ({n} stores, {total_qty:.0f} units) — differentiate via photos and title, not price alone.")
-    elif n <= 2:
-        recs.append("Low competition — early mover advantage; focus on SEO and consistent sales history.")
 
-    return recs[:5]
+    # --- PRICING ---
+    if price_spread <= 2:
+        recs.append(
+            f"Set price at ${best_price:.0f}. "
+            f"All {n} stores price within ${price_spread:.0f} of each other — "
+            f"win on title and photo quality, not price."
+        )
+    elif best_price < max(prices):
+        ideal_low = round(min(prices) * 1.05)
+        ideal_high = round(best_price * 1.1)
+        recs.append(
+            f"Set price between ${ideal_low}–${ideal_high}. "
+            f"The top seller at ${best_price:.0f} outsells listings priced up to ${max(prices):.0f} — "
+            f"this is a price-sensitive market."
+        )
+    else:
+        recs.append(
+            f"Set price at ${best_price:.0f} or above. "
+            f"The highest-priced listing leads sales — buyers signal premium preference here. "
+            f"Avoid underpricing below ${round(best_price * 0.9):.0f}."
+        )
+
+    # --- TITLE KEYWORDS ---
+    exclusive_power = sorted(best_power - set(w for i in ranked[1:] for w in i.get("power_words", [])))
+    if exclusive_power:
+        kws = ", ".join(f"'{w}'" for w in exclusive_power[:3])
+        recs.append(
+            f"Include {kws} in the first 5 words of your title. "
+            f"Only the top-performing listing uses {'this keyword' if len(exclusive_power)==1 else 'these keywords'} — "
+            f"it differentiates the winner from {n-1} competitors."
+        )
+
+    missing_power = [w for w in ["gift", "handmade", "gold", "minimalist"] if w in all_power and w not in best_power]
+    if missing_power:
+        kws = ", ".join(f"'{w}'" for w in missing_power[:2])
+        recs.append(
+            f"Avoid relying on {kws} alone — competitors use {'it' if len(missing_power)==1 else 'them'} "
+            f"but the top seller does not, and still leads. Focus on other differentiators."
+        )
+
+    # --- TITLE LENGTH ---
+    if best_wc > avg_wc * 1.15:
+        recs.append(
+            f"Write titles with {best_wc}–{max(word_counts)} words. "
+            f"The winning listing uses {best_wc} words vs the cluster average of {avg_wc} — "
+            f"longer titles capture more search terms here."
+        )
+    elif best_wc < avg_wc * 0.85:
+        recs.append(
+            f"Keep titles under {best_wc + 2} words. "
+            f"The winning listing at {best_wc} words outperforms longer ones (avg {avg_wc}) — "
+            f"buyers in this category respond to concise, direct titles."
+        )
+
+    # --- COMPETITION POSITIONING ---
+    if n >= 5 and total_qty >= 1000:
+        recs.append(
+            f"Invest in high-quality photos — {n} stores compete for {total_qty:.0f} combined units. "
+            f"With near-identical products, listing photo is the primary differentiator."
+        )
+    elif n <= 2:
+        recs.append(
+            f"Enter this market now — only {n} store{'s' if n > 1 else ''} currently sell this product. "
+            f"Build review history early to secure ranking before competition grows."
+        )
+
+    return recs[:4]
 
 
 def analyze_clusters(clusters: list, agg: pd.DataFrame) -> list[dict]:
