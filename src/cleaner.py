@@ -1,5 +1,5 @@
+import math
 import re
-from datetime import datetime
 
 import pandas as pd
 
@@ -20,30 +20,38 @@ def _sheet_to_period(sheet_name: str) -> int | None:
     return year * 100 + month if month else None
 
 
+_DECAY_K = 0.02  # per-month decay constant (~2% drop per month)
+
+
+def _period_to_months(period: int) -> int:
+    """Convert YYYYMM to total months (e.g. 202605 → 24277)."""
+    return (period // 100) * 12 + (period % 100)
+
+
 def _build_recency_weights(df: pd.DataFrame) -> dict[str, float]:
-    """Map each sheet name to a linear recency weight in (0, 1]."""
+    """Map each sheet name to an exponential decay weight; latest month = 1.0."""
     sheets = df["_sheet"].dropna().unique()
     periods = {s: _sheet_to_period(s) for s in sheets}
     valid = {s: p for s, p in periods.items() if p}
     if not valid:
         return {s: 1.0 for s in sheets}
 
-    min_p, max_p = min(valid.values()), max(valid.values())
-    latest = max(valid, key=valid.get)
-    print(f"Latest sheet detected: '{latest}' (period {max_p})")
+    latest_sheet = max(valid, key=valid.get)
+    latest_months = _period_to_months(valid[latest_sheet])
+    print(f"Latest sheet detected: '{latest_sheet}'")
 
     weights = {}
     for sheet, period in valid.items():
-        if max_p == min_p:
-            weights[sheet] = 1.0
-        else:
-            weights[sheet] = round(0.1 + 0.9 * (period - min_p) / (max_p - min_p), 4)
+        diff = latest_months - _period_to_months(period)  # months behind latest
+        weights[sheet] = round(math.exp(-_DECAY_K * diff), 4)
 
-    # Print a few sample weights
-    sample = sorted(weights.items(), key=lambda x: x[1])
-    print("Sample weights (oldest → newest):")
-    for s, w in sample[:3] + sample[-3:]:
-        print(f"  {s}: {w}")
+    # Debug: show weights for latest, ~12 months ago, ~36 months ago
+    by_age = sorted(valid.items(), key=lambda x: x[1], reverse=True)
+    targets = {"latest": 0, "1 year ago": 12, "3 years ago": 36}
+    print("Sample weights:")
+    for label, target_diff in targets.items():
+        closest = min(by_age, key=lambda x: abs(latest_months - _period_to_months(x[1]) - target_diff))
+        print(f"  {label} ({closest[0]}): {weights[closest[0]]}")
 
     return weights
 
