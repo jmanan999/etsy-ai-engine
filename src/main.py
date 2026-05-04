@@ -5,7 +5,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from loader import load_google_sheet
 from cleaner import clean_data, aggregate_data
-from insights import load_aggregated_data, extract_keywords, extract_bigrams, save_insights
+from insights import load_aggregated_data, extract_keywords, extract_bigrams, save_insights, extract_patterns, save_patterns
 
 SHEET_URL = "https://docs.google.com/spreadsheets/d/10G9EOz16NknPMEA0cpwT-xRvaDe63HVOyWxLjLy28rw/edit?usp=sharing"
 OUTPUTS = os.path.join(os.path.dirname(__file__), "..", "outputs")
@@ -40,6 +40,15 @@ def main():
     print("\nTop 10 bigrams:")
     for bigram, count in bigrams[:10]:
         print(f"  {bigram}: {count}")
+
+    print("\nExtracting title patterns...")
+    patterns_path = os.path.abspath(os.path.join(OUTPUTS, "patterns.json"))
+    patterns = extract_patterns(aggregated)
+    save_patterns(patterns, patterns_path)
+    print(f"Saved patterns to {patterns_path}")
+    print("\nTop 10 patterns:")
+    for pattern, count in patterns[:10]:
+        print(f"  {pattern}: {count}")
 
     print("\nSample cleaned output:")
     print(cleaned.head(3).to_string())

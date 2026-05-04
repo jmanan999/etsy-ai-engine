@@ -51,3 +51,44 @@ def save_insights(keywords: list, bigrams: list, output_path: str) -> None:
     }
     with open(output_path, "w") as f:
         json.dump(data, f, indent=2)
+
+
+_CATEGORIES = {
+    "MATERIAL": {"gold", "silver", "brass", "gemstone"},
+    "PRODUCT":  {"ring", "earrings", "necklace", "bracelet", "pendant", "cuff"},
+    "STYLE":    {"boho", "statement", "minimalist", "vintage", "gothic", "stacking"},
+    "OCCASION": {"gift", "wedding", "birthday", "anniversary"},
+}
+
+# Reverse lookup: word -> category
+_WORD_TO_CATEGORY = {
+    word: cat
+    for cat, words in _CATEGORIES.items()
+    for word in words
+}
+
+
+def _title_pattern(title: str) -> str | None:
+    """Return the ordered set of categories present in a title, e.g. 'MATERIAL + PRODUCT'."""
+    seen = []
+    for word in _tokenize(title):
+        cat = _WORD_TO_CATEGORY.get(word)
+        if cat and cat not in seen:
+            seen.append(cat)
+    return " + ".join(seen) if seen else None
+
+
+def extract_patterns(df: pd.DataFrame, top_n: int = 20) -> list[tuple[str, int]]:
+    top = df.sort_values("total_quantity", ascending=False).head(_TOP_N_PRODUCTS)
+    counts: Counter = Counter()
+    for title in top["title"]:
+        pattern = _title_pattern(str(title))
+        if pattern:
+            counts[pattern] += 1
+    return counts.most_common(top_n)
+
+
+def save_patterns(patterns: list, output_path: str) -> None:
+    data = {"top_patterns": [{"pattern": p, "count": c} for p, c in patterns]}
+    with open(output_path, "w") as f:
+        json.dump(data, f, indent=2)
