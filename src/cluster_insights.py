@@ -16,6 +16,10 @@ _POWER_WORDS = ["gift", "handmade", "gold", "minimalist", "silver", "brass",
                 "boho", "vintage", "statement", "adjustable", "personalized",
                 "unique", "custom", "birthday", "wedding", "anniversary"]
 
+# Keywords that signal untapped audiences — checked for absence in cluster
+_GAP_SIGNALS = ["men", "mens", "unisex", "kids", "bulk", "set", "pair",
+                "custom", "personalized", "engraved", "sterling", "rose"]
+
 
 def _extract_features(title: str) -> dict:
     words = re.findall(r"[a-z]{3,}", title.lower())
@@ -34,6 +38,35 @@ def _extract_features(title: str) -> dict:
         "word_count": len(title.split()),
         "power_words": power_hits,
     }
+
+
+def detect_gaps(items_with_data: list[dict]) -> list[str]:
+    """Find _GAP_SIGNALS absent from all titles in the cluster."""
+    all_words = set()
+    for item in items_with_data:
+        all_words.update(item["title"].lower().split())
+    return [kw for kw in _GAP_SIGNALS if kw not in all_words]
+
+
+def differentiation_score(best: dict, others: list[dict]) -> float:
+    """How unique is the best listing's keyword set vs all others (0–1)."""
+    best_words = set(best["title"].lower().split())
+    other_words = set(w for i in others for w in i["title"].lower().split())
+    if not best_words | other_words:
+        return 0.0
+    exclusive = best_words - other_words
+    return round(len(exclusive) / len(best_words), 3)
+
+
+def entry_opportunity(n_stores: int, total_qty: float, is_dominated: bool) -> str:
+    """Simple three-tier entry signal based on competition and demand."""
+    if n_stores <= 2 and total_qty >= 300:
+        return "high"
+    if n_stores >= 6 and is_dominated:
+        return "low"
+    if total_qty >= 1000 and n_stores <= 5:
+        return "high"
+    return "medium"
 
 
 def load_data() -> tuple[list, pd.DataFrame]:
@@ -125,6 +158,24 @@ def _generate_insights(items_with_data: list[dict]) -> list[str]:
     if total_qty >= 500:
         insights.append(f"High demand — {total_qty:.0f} combined units, strong market signal.")
 
+    # --- Gap signals ---
+    gaps = detect_gaps(items_with_data)
+    if gaps:
+        sample = ", ".join(f"'{g}'" for g in gaps[:3])
+        insights.append(f"No listing uses {sample} — potential positioning gap exists.")
+
+    # --- Market saturation ---
+    n = len(items_with_data)
+    runner_up_qty = quantities[1] if len(quantities) > 1 else 1
+    is_dominated = best["quantity"] >= 3 * runner_up_qty
+    opp = entry_opportunity(n, sum(quantities), is_dominated)
+    if opp == "high":
+        insights.append("Underserved niche detected — strong entry opportunity.")
+    elif opp == "low":
+        insights.append("Market is dominated by one player — difficult to compete without strong differentiation.")
+    elif n >= 6:
+        insights.append(f"Saturated market ({n} stores) — requires distinct positioning to win.")
+
     return insights if insights else ["Insufficient data for actionable insight."]
 
 
@@ -200,16 +251,34 @@ def _generate_recommendations(items_with_data: list[dict]) -> list[str]:
             f"buyers in this category respond to concise, direct titles."
         )
 
+    # --- GAP OPPORTUNITIES ---
+    gaps = detect_gaps(items_with_data)
+    if gaps:
+        sample = ", ".join(f"'{g}'" for g in gaps[:2])
+        recs.append(
+            f"Target the {sample} audience — no competitor uses {'this keyword' if len(gaps)==1 else 'these keywords'}. "
+            f"Add it to title and tags to capture uncontested search traffic."
+        )
+
     # --- COMPETITION POSITIONING ---
-    if n >= 5 and total_qty >= 1000:
+    runner_up_qty = sorted(quantities, reverse=True)[1] if len(quantities) > 1 else 1
+    is_dominated = best["quantity"] >= 3 * runner_up_qty
+    opp = entry_opportunity(n, total_qty, is_dominated)
+
+    if opp == "high":
+        recs.append(
+            f"Enter this market — demand is strong ({total_qty:.0f} units) and competition is low ({n} stores). "
+            f"Launch with competitive pricing and build reviews fast."
+        )
+    elif opp == "low":
+        recs.append(
+            f"Avoid direct competition — '{best['store']}' dominates with {best['quantity']:.0f} units. "
+            f"Enter only with a meaningfully different design, audience, or price tier."
+        )
+    elif n >= 5 and total_qty >= 1000:
         recs.append(
             f"Invest in high-quality photos — {n} stores compete for {total_qty:.0f} combined units. "
             f"With near-identical products, listing photo is the primary differentiator."
-        )
-    elif n <= 2:
-        recs.append(
-            f"Enter this market now — only {n} store{'s' if n > 1 else ''} currently sell this product. "
-            f"Build review history early to secure ranking before competition grows."
         )
 
     return recs[:4]
@@ -250,21 +319,31 @@ def analyze_clusters(clusters: list, agg: pd.DataFrame) -> list[dict]:
 
         ranked = sorted(items_with_data, key=lambda x: x["quantity"], reverse=True)
         prices = [i["price"] for i in items_with_data]
-        total_qty = sum(i["quantity"] for i in items_with_data)
+        quantities = [i["quantity"] for i in items_with_data]
+        total_qty = sum(quantities)
         num_unique_images = len({i["image_url"] for i in items})
+
+        best = ranked[0]
+        runner_up_qty = quantities[1] if len(quantities) > 1 else 1
+        is_dominated = best["quantity"] >= 3 * runner_up_qty
+        diff_score = differentiation_score(best, ranked[1:])
+        opp = entry_opportunity(len(stores), total_qty, is_dominated)
 
         results.append({
             "cluster_id": cluster["cluster_id"],
             "num_stores": len(stores),
             "stores": stores,
             "num_unique_images": num_unique_images,
-            "best_store": ranked[0]["store"],
-            "best_title": ranked[0]["title"],
-            "best_quantity": round(ranked[0]["quantity"], 1),
+            "differentiation_score": diff_score,
+            "entry_opportunity": opp,
+            "best_store": best["store"],
+            "best_title": best["title"],
+            "best_quantity": round(best["quantity"], 1),
             "total_quantity": round(total_qty, 1),
             "price_range": [round(min(prices), 2), round(max(prices), 2)],
             "avg_price": round(sum(prices) / len(prices), 2),
             "price_spread": round(max(prices) - min(prices), 2),
+            "keyword_gaps": detect_gaps(items_with_data),
             "items": items_with_data,
             "insights": _generate_insights(items_with_data),
             "recommendations": _generate_recommendations(items_with_data),
@@ -296,7 +375,8 @@ def run():
     for r in results[:5]:
         print(f"\nCluster {r['cluster_id']} | {r['num_stores']} stores | "
               f"${r['price_range'][0]}–${r['price_range'][1]} | "
-              f"{r['total_quantity']:.0f} total units")
+              f"{r['total_quantity']:.0f} units | "
+              f"entry={r['entry_opportunity'].upper()} | diff_score={r['differentiation_score']}")
         print(f"  Best store:  {r['best_store']}  ({r['best_quantity']:.0f} units @ ${r['avg_price']})")
         print(f"  Best title:  {r['best_title'][:75]}")
         for insight in r["insights"][:2]:
