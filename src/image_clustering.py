@@ -1,5 +1,6 @@
 import json
 import os
+import pickle
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -12,8 +13,9 @@ from sentence_transformers import SentenceTransformer
 _embedding_cache: dict[str, np.ndarray] = {}
 
 _OUTPUTS = os.path.join(os.path.dirname(__file__), "..", "outputs")
+_CLUSTERS_DIR = os.path.join(_OUTPUTS, "clusters")
+_CACHE_PATH = os.path.abspath(os.path.join(_OUTPUTS, "embedding_cache.pkl"))
 _SIMILARITY_THRESHOLD = 0.85
-_TOP_N = 2000
 
 _CATEGORY_KEYWORDS = {
     "ring":      ["ring", "band", "signet", "dome", "knuckle", "thumb"],
@@ -96,6 +98,22 @@ def _load_image(url: str):
         return Image.open(BytesIO(r.content)).convert("RGB")
     except Exception:
         return None
+
+
+def load_embedding_cache() -> None:
+    global _embedding_cache
+    if os.path.exists(_CACHE_PATH):
+        with open(_CACHE_PATH, "rb") as f:
+            _embedding_cache = pickle.load(f)
+        print(f"Loaded embedding cache: {len(_embedding_cache)} entries from {_CACHE_PATH}")
+    else:
+        print("No embedding cache found — starting fresh.")
+
+
+def save_embedding_cache() -> None:
+    with open(_CACHE_PATH, "wb") as f:
+        pickle.dump(_embedding_cache, f)
+    print(f"Embedding cache saved: {len(_embedding_cache)} entries → {_CACHE_PATH}")
 
 
 def generate_embeddings(df: pd.DataFrame, model: SentenceTransformer) -> tuple[list, list[int]]:
@@ -202,6 +220,24 @@ def cluster_by_similarity(embeddings: list, valid_idx: list, df: pd.DataFrame) -
     return clusters
 
 
+def _block_output_path(cat: str, bucket: str) -> str:
+    os.makedirs(_CLUSTERS_DIR, exist_ok=True)
+    return os.path.join(_CLUSTERS_DIR, f"clusters_{cat}_{bucket}.json")
+
+
+def _save_block(clusters: list[list], cat: str, bucket: str, id_offset: int) -> str:
+    path = _block_output_path(cat, bucket)
+    data = {
+        "clusters": [
+            {"cluster_id": f"P{str(id_offset + i + 1).zfill(4)}", "items": items}
+            for i, items in enumerate(clusters)
+        ]
+    }
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+    return path
+
+
 def save_clusters(clusters: list[list], output_path: str) -> None:
     data = {
         "clusters": [
@@ -216,30 +252,47 @@ def save_clusters(clusters: list[list], output_path: str) -> None:
 def run():
     start = time.time()
 
+    load_embedding_cache()
+
     print("Loading data...")
     df = load_data()
-    sample = df.head(_TOP_N).reset_index(drop=True)
-    print(f"Using top {len(sample)} products for clustering.")
+    print(f"Using full dataset: {len(df)} products.")
 
-    sample = apply_blocking(sample)
+    df = apply_blocking(df)
 
     print("Loading CLIP model...")
     model = SentenceTransformer("clip-ViT-B-32")
 
     all_clusters = []
-    groups = list(sample.groupby(["category", "price_bucket"]))
+    id_offset = 0
+    groups = list(df.groupby(["category", "price_bucket"]))
+
     for (cat, bucket), block in groups:
         block = block.reset_index(drop=True)
-        print(f"Block [{cat} / {bucket}]: {len(block)} items — embedding...")
-        embeddings, valid_idx = generate_embeddings(block, model)
-        if not embeddings:
+        print(f"\nBlock [{cat} / {bucket}]: {len(block)} items — embedding...")
+        try:
+            embeddings, valid_idx = generate_embeddings(block, model)
+            if not embeddings:
+                print(f"  No embeddings — skipping.")
+                continue
+            clusters = cluster_by_similarity(embeddings, valid_idx, block)
+            block_path = _save_block(clusters, cat, bucket, id_offset)
+            id_offset += len(clusters)
+            all_clusters.extend(clusters)
+            multi = sum(1 for c in clusters if len({i["store"] for i in c}) > 1)
+            print(f"  → {len(clusters)} clusters formed ({multi} multi-store). Saved to {block_path}")
+        except Exception as e:
+            print(f"  ERROR in block [{cat}/{bucket}]: {e} — skipping.")
             continue
-        clusters = cluster_by_similarity(embeddings, valid_idx, block)
-        all_clusters.extend(clusters)
-        print(f"  → {len(clusters)} clusters formed.")
 
-    output_path = os.path.abspath(os.path.join(_OUTPUTS, "image_clusters.json"))
-    save_clusters(all_clusters, output_path)
+    save_embedding_cache()
+
+    full_output_path = os.path.abspath(os.path.join(_OUTPUTS, "image_clusters_full.json"))
+    save_clusters(all_clusters, full_output_path)
+
+    # Also update the default clusters file used by cluster_insights.py
+    default_output_path = os.path.abspath(os.path.join(_OUTPUTS, "image_clusters.json"))
+    save_clusters(all_clusters, default_output_path)
 
     multi_store = [c for c in all_clusters if len(set(i["store"] for i in c)) > 1]
     elapsed = round(time.time() - start, 1)
@@ -258,7 +311,7 @@ def run():
                 print(f"  img_sim={item['img_sim']}  title_sim={item['title_sim']}  [{item['condition']}]")
             print()
 
-    print(f"Saved to {output_path}")
+    print(f"Full results saved to {full_output_path}")
 
 
 if __name__ == "__main__":
