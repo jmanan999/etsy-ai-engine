@@ -174,10 +174,32 @@ def _matches(emb_i: np.ndarray, title_i: str, emb_j: np.ndarray, title_j: str) -
     return False, img_sim, title_sim, ""
 
 
+def _anchor_match(anchor_emb: np.ndarray, anchor_title: str,
+                   emb_j: np.ndarray, title_j: str,
+                   cluster_embs: list[np.ndarray]) -> tuple[bool, float, float, str]:
+    """
+    Accept j into cluster only if it matches the anchor directly.
+    Primary:  anchor img_sim >= 0.85  (STRONG_IMAGE)
+    Fallback: anchor img_sim >= 0.80 AND avg img_sim across cluster >= 0.75  (HYBRID_MATCH)
+    """
+    anchor_img_sim = _cosine_similarity(anchor_emb, emb_j)
+    anchor_title_sim = compute_title_similarity(anchor_title, title_j)
+
+    if anchor_img_sim >= 0.85:
+        return True, anchor_img_sim, anchor_title_sim, "STRONG_IMAGE"
+
+    if anchor_img_sim >= 0.80:
+        avg_cluster_sim = sum(_cosine_similarity(e, emb_j) for e in cluster_embs) / len(cluster_embs)
+        if avg_cluster_sim >= 0.75:
+            return True, anchor_img_sim, anchor_title_sim, "HYBRID_MATCH"
+
+    return False, anchor_img_sim, anchor_title_sim, ""
+
+
 def cluster_by_similarity(embeddings: list, valid_idx: list, df: pd.DataFrame) -> list[dict]:
-    """Greedy clustering with cluster-wide comparison (chain similarity)."""
-    clusters = []        # list of list-of-items
-    cluster_embs = []    # list of list-of-embeddings (parallel to clusters)
+    """Greedy clustering with anchor-based validation to prevent chain drift."""
+    clusters = []
+    cluster_embs_list = []  # parallel to clusters: list of list-of-embeddings
     assigned = set()
 
     for i, (emb_i, idx_i) in enumerate(zip(embeddings, valid_idx)):
@@ -190,32 +212,34 @@ def cluster_by_similarity(embeddings: list, valid_idx: list, df: pd.DataFrame) -
             "image_url": df.at[idx_i, "image_url"],
         }]
         new_embs = [emb_i]
+        anchor_emb = emb_i
+        anchor_title = title_i
         assigned.add(i)
 
         for j, (emb_j, idx_j) in enumerate(zip(embeddings, valid_idx)):
             if j in assigned:
                 continue
             title_j = df.at[idx_j, "title"]
-            # Compare j against every item already in the cluster
-            for emb_k, item_k in zip(new_embs, new_cluster):
-                matched, img_sim, title_sim, condition = _matches(
-                    emb_k, item_k["title"], emb_j, title_j
-                )
-                if matched:
-                    new_cluster.append({
-                        "title": title_j,
-                        "store": df.at[idx_j, "store_name"],
-                        "image_url": df.at[idx_j, "image_url"],
-                        "img_sim": round(img_sim, 3),
-                        "title_sim": round(title_sim, 3),
-                        "condition": condition,
-                    })
-                    new_embs.append(emb_j)
-                    assigned.add(j)
-                    break
+            matched, img_sim, title_sim, condition = _anchor_match(
+                anchor_emb, anchor_title, emb_j, title_j, new_embs
+            )
+            if matched:
+                new_cluster.append({
+                    "title": title_j,
+                    "store": df.at[idx_j, "store_name"],
+                    "image_url": df.at[idx_j, "image_url"],
+                    "img_sim": round(img_sim, 3),
+                    "title_sim": round(title_sim, 3),
+                    "condition": condition,
+                })
+                new_embs.append(emb_j)
+                assigned.add(j)
+
+        if len(new_cluster) > 200:
+            print(f"  ⚠️  Large cluster warning: {len(new_cluster)} items (anchor: '{title_i[:60]}')")
 
         clusters.append(new_cluster)
-        cluster_embs.append(new_embs)
+        cluster_embs_list.append(new_embs)
 
     return clusters
 
@@ -296,9 +320,14 @@ def run():
 
     multi_store = [c for c in all_clusters if len(set(i["store"] for i in c)) > 1]
     elapsed = round(time.time() - start, 1)
+    sizes = [len(c) for c in all_clusters]
+    avg_size = round(sum(sizes) / len(sizes), 1) if sizes else 0
+    max_size = max(sizes) if sizes else 0
 
     print(f"\nTotal clusters:            {len(all_clusters)}")
     print(f"Multi-store clusters:      {len(multi_store)}")
+    print(f"Largest cluster:           {max_size} items")
+    print(f"Average cluster size:      {avg_size} items")
     print(f"Runtime:                   {elapsed}s")
 
     if multi_store:
