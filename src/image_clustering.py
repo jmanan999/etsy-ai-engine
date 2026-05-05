@@ -3,6 +3,7 @@ import os
 import pickle
 import time
 from concurrent.futures import ThreadPoolExecutor
+from io import BytesIO
 
 import numpy as np
 import pandas as pd
@@ -16,6 +17,9 @@ _OUTPUTS = os.path.join(os.path.dirname(__file__), "..", "outputs")
 _CLUSTERS_DIR = os.path.join(_OUTPUTS, "clusters")
 _CACHE_PATH = os.path.abspath(os.path.join(_OUTPUTS, "embedding_cache.pkl"))
 _SIMILARITY_THRESHOLD = 0.85
+_BATCH_SIZE = 32
+_DOWNLOAD_WORKERS = 30
+_BLOCK_SPLIT_THRESHOLD = 2000
 
 _CATEGORY_KEYWORDS = {
     "ring":      ["ring", "band", "signet", "dome", "knuckle", "thumb"],
@@ -24,6 +28,15 @@ _CATEGORY_KEYWORDS = {
     "necklace":  ["necklace", "pendant", "chain", "choker", "locket", "charm"],
     "cuff":      ["cuff", "armlet", "arm band", "armband", "upper arm"],
     "other":     [],
+}
+
+# Sub-keywords used to split oversized blocks
+_SUBCATEGORY_KEYWORDS = {
+    "ring":     [["signet", "dome", "thumb", "knuckle"], ["band", "plain", "simple"], ["stone", "gem", "crystal"]],
+    "earring":  [["hoop", "huggie"], ["stud", "flat"], ["dangle", "drop"]],
+    "bracelet": [["bangle", "kada"], ["anklet", "ankle"], ["chain", "link"]],
+    "necklace": [["pendant", "charm", "locket"], ["chain", "link"], ["choker"]],
+    "cuff":     [["cuff", "armlet"], ["armband", "upper arm"]],
 }
 
 
@@ -74,6 +87,28 @@ def apply_blocking(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _split_large_block(block: pd.DataFrame, cat: str) -> list[pd.DataFrame]:
+    """Split an oversized block using sub-category keywords."""
+    sub_groups = _SUBCATEGORY_KEYWORDS.get(cat, [])
+    if not sub_groups:
+        return [block]
+
+    assigned = pd.Series(False, index=block.index)
+    splits = []
+    for kws in sub_groups:
+        mask = block["title"].str.lower().apply(lambda t: any(kw in t for kw in kws)) & ~assigned
+        sub = block[mask]
+        if len(sub) > 0:
+            splits.append(sub.reset_index(drop=True))
+            assigned |= mask
+
+    remainder = block[~assigned]
+    if len(remainder) > 0:
+        splits.append(remainder.reset_index(drop=True))
+
+    return splits if splits else [block]
+
+
 def load_data() -> pd.DataFrame:
     cleaned = pd.read_csv(os.path.join(_OUTPUTS, "cleaned_data.csv"),
                           dtype={"transaction_id": str})
@@ -83,21 +118,9 @@ def load_data() -> pd.DataFrame:
 
     df = cleaned.merge(images, on="transaction_id", how="inner")
     df = df.dropna(subset=["image_url", "title", "store_name"])
-
     df = df.reset_index(drop=True)
     print(f"Products with images: {len(df)}")
     return df
-
-
-def _load_image(url: str):
-    try:
-        url = url.replace("il_75x75", "il_794x794")
-        r = requests.get(url, timeout=10)
-        r.raise_for_status()
-        from io import BytesIO
-        return Image.open(BytesIO(r.content)).convert("RGB")
-    except Exception:
-        return None
 
 
 def load_embedding_cache() -> None:
@@ -116,43 +139,72 @@ def save_embedding_cache() -> None:
     print(f"Embedding cache saved: {len(_embedding_cache)} entries → {_CACHE_PATH}")
 
 
+def _fetch_image(url: str) -> tuple[str, Image.Image | None]:
+    """Download one image; return (url, PIL Image or None)."""
+    hires = url.replace("il_75x75", "il_794x794")
+    try:
+        r = requests.get(hires, timeout=5)
+        r.raise_for_status()
+        return url, Image.open(BytesIO(r.content)).convert("RGB")
+    except Exception:
+        return url, None
+
+
 def generate_embeddings(df: pd.DataFrame, model: SentenceTransformer) -> tuple[list, list[int]]:
-    """Parallel image fetch + embed with per-URL caching."""
-    cache_hits = 0
+    """
+    Stage 1: parallel download of unique URLs not in cache.
+    Stage 2: batch encode all new images at once.
+    Maps embeddings back to every row sharing the same URL.
+    """
+    urls = df["image_url"].tolist()
+    unique_urls = list(dict.fromkeys(urls))  # preserve order, deduplicate
 
-    def load_and_embed(args):
-        nonlocal cache_hits
-        idx, row = args
-        url = row["image_url"]
-        if url in _embedding_cache:
-            cache_hits += 1
-            return idx, _embedding_cache[url]
-        img = _load_image(url)
-        if img is None:
-            return idx, None
-        emb = model.encode(img, convert_to_numpy=True)
-        emb = emb / (np.linalg.norm(emb) + 1e-9)
-        _embedding_cache[url] = emb
-        return idx, emb
+    # Split into cached vs needs download
+    cached_urls = {u for u in unique_urls if u in _embedding_cache}
+    to_download = [u for u in unique_urls if u not in cached_urls]
 
-    t0 = time.time()
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        results = list(executor.map(load_and_embed, df.iterrows()))
+    t_dl = time.time()
+    url_to_image: dict[str, Image.Image] = {}
+    if to_download:
+        with ThreadPoolExecutor(max_workers=_DOWNLOAD_WORKERS) as ex:
+            for url, img in ex.map(_fetch_image, to_download):
+                if img is not None:
+                    url_to_image[url] = img
+    dl_elapsed = round(time.time() - t_dl, 1)
 
+    # Stage 2: batch embed all new images
+    t_emb = time.time()
+    new_urls = list(url_to_image.keys())
+    new_images = [url_to_image[u] for u in new_urls]
+    if new_images:
+        raw = model.encode(new_images, batch_size=_BATCH_SIZE, convert_to_numpy=True, show_progress_bar=False)
+        norms = np.linalg.norm(raw, axis=1, keepdims=True)
+        normalized = raw / (norms + 1e-9)
+        for url, emb in zip(new_urls, normalized):
+            _embedding_cache[url] = emb
+    emb_elapsed = round(time.time() - t_emb, 1)
+
+    cache_hits = len(cached_urls)
+    new_count = len(new_images)
+    failed = len(to_download) - new_count
+    print(f"  Unique URLs: {len(unique_urls)} | cache hits: {cache_hits} | "
+          f"new: {new_count} | failed: {failed} | "
+          f"download: {dl_elapsed}s | embed: {emb_elapsed}s")
+
+    # Map embeddings back to all rows
     embeddings, valid_idx = [], []
-    for idx, emb in results:
+    for idx, url in enumerate(urls):
+        emb = _embedding_cache.get(url)
         if emb is not None:
             embeddings.append(emb)
             valid_idx.append(idx)
 
-    elapsed = round(time.time() - t0, 1)
-    print(f"  Embedded {len(embeddings)} images in {elapsed}s "
-          f"(cache hits: {cache_hits}, new: {len(embeddings) - cache_hits})")
     return embeddings, valid_idx
 
 
 def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
-    return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-9))
+    # Embeddings are pre-normalized — dot product is sufficient
+    return float(np.dot(a, b))
 
 
 def compute_title_similarity(title1: str, title2: str) -> float:
@@ -182,6 +234,12 @@ def _anchor_match(anchor_emb: np.ndarray, anchor_title: str,
     Primary:  anchor img_sim >= 0.85  (STRONG_IMAGE)
     Fallback: anchor img_sim >= 0.80 AND avg img_sim across cluster >= 0.75  (HYBRID_MATCH)
     """
+    # Early rejection: skip cosine if titles share zero words
+    if not (set(anchor_title.lower().split()) & set(title_j.lower().split())):
+        anchor_img_sim = _cosine_similarity(anchor_emb, emb_j)
+        if anchor_img_sim < 0.80:
+            return False, anchor_img_sim, 0.0, ""
+
     anchor_img_sim = _cosine_similarity(anchor_emb, emb_j)
     anchor_title_sim = compute_title_similarity(anchor_title, title_j)
 
@@ -199,7 +257,7 @@ def _anchor_match(anchor_emb: np.ndarray, anchor_title: str,
 def cluster_by_similarity(embeddings: list, valid_idx: list, df: pd.DataFrame) -> list[dict]:
     """Greedy clustering with anchor-based validation to prevent chain drift."""
     clusters = []
-    cluster_embs_list = []  # parallel to clusters: list of list-of-embeddings
+    cluster_embs_list = []
     assigned = set()
 
     for i, (emb_i, idx_i) in enumerate(zip(embeddings, valid_idx)):
@@ -244,13 +302,14 @@ def cluster_by_similarity(embeddings: list, valid_idx: list, df: pd.DataFrame) -
     return clusters
 
 
-def _block_output_path(cat: str, bucket: str) -> str:
+def _block_output_path(cat: str, bucket: str, sub: int | None = None) -> str:
     os.makedirs(_CLUSTERS_DIR, exist_ok=True)
-    return os.path.join(_CLUSTERS_DIR, f"clusters_{cat}_{bucket}.json")
+    suffix = f"_{sub}" if sub is not None else ""
+    return os.path.join(_CLUSTERS_DIR, f"clusters_{cat}_{bucket}{suffix}.json")
 
 
-def _save_block(clusters: list[list], cat: str, bucket: str, id_offset: int) -> str:
-    path = _block_output_path(cat, bucket)
+def _save_block(clusters: list[list], cat: str, bucket: str, id_offset: int, sub: int | None = None) -> str:
+    path = _block_output_path(cat, bucket, sub)
     data = {
         "clusters": [
             {"cluster_id": f"P{str(id_offset + i + 1).zfill(4)}", "items": items}
@@ -265,7 +324,7 @@ def _save_block(clusters: list[list], cat: str, bucket: str, id_offset: int) -> 
 def save_clusters(clusters: list[list], output_path: str) -> None:
     data = {
         "clusters": [
-            {"cluster_id": f"P{str(i+1).zfill(3)}", "items": items}
+            {"cluster_id": f"P{str(i+1).zfill(4)}", "items": items}
             for i, items in enumerate(clusters)
         ]
     }
@@ -293,28 +352,38 @@ def run():
 
     for (cat, bucket), block in groups:
         block = block.reset_index(drop=True)
-        print(f"\nBlock [{cat} / {bucket}]: {len(block)} items — embedding...")
-        try:
-            embeddings, valid_idx = generate_embeddings(block, model)
-            if not embeddings:
-                print(f"  No embeddings — skipping.")
+
+        # Split oversized blocks into sub-blocks
+        if len(block) > _BLOCK_SPLIT_THRESHOLD:
+            sub_blocks = _split_large_block(block, cat)
+            print(f"\nBlock [{cat} / {bucket}]: {len(block)} items → split into {len(sub_blocks)} sub-blocks")
+        else:
+            sub_blocks = [block]
+
+        for sub_idx, sub_block in enumerate(sub_blocks):
+            sub_label = f"sub-{sub_idx}" if len(sub_blocks) > 1 else None
+            label = f"[{cat} / {bucket}{f' / {sub_label}' if sub_label else ''}]"
+            print(f"\n  Block {label}: {len(sub_block)} items — downloading + embedding...")
+            try:
+                embeddings, valid_idx = generate_embeddings(sub_block, model)
+                if not embeddings:
+                    print(f"  No embeddings — skipping.")
+                    continue
+                clusters = cluster_by_similarity(embeddings, valid_idx, sub_block)
+                block_path = _save_block(clusters, cat, bucket, id_offset, sub=sub_idx if len(sub_blocks) > 1 else None)
+                id_offset += len(clusters)
+                all_clusters.extend(clusters)
+                multi = sum(1 for c in clusters if len({i["store"] for i in c}) > 1)
+                print(f"  → {len(clusters)} clusters ({multi} multi-store). Saved to {block_path}")
+            except Exception as e:
+                print(f"  ERROR in block {label}: {e} — skipping.")
                 continue
-            clusters = cluster_by_similarity(embeddings, valid_idx, block)
-            block_path = _save_block(clusters, cat, bucket, id_offset)
-            id_offset += len(clusters)
-            all_clusters.extend(clusters)
-            multi = sum(1 for c in clusters if len({i["store"] for i in c}) > 1)
-            print(f"  → {len(clusters)} clusters formed ({multi} multi-store). Saved to {block_path}")
-        except Exception as e:
-            print(f"  ERROR in block [{cat}/{bucket}]: {e} — skipping.")
-            continue
 
     save_embedding_cache()
 
     full_output_path = os.path.abspath(os.path.join(_OUTPUTS, "image_clusters_full.json"))
     save_clusters(all_clusters, full_output_path)
 
-    # Also update the default clusters file used by cluster_insights.py
     default_output_path = os.path.abspath(os.path.join(_OUTPUTS, "image_clusters.json"))
     save_clusters(all_clusters, default_output_path)
 
@@ -341,6 +410,23 @@ def run():
             print()
 
     print(f"Full results saved to {full_output_path}")
+
+
+# --- OPTIONAL (DISABLED): FAISS-based nearest neighbor search ---
+# Uncomment to enable approximate nearest neighbor retrieval per block.
+# Requires: pip install faiss-cpu
+#
+# import faiss
+# def build_faiss_index(embeddings: list[np.ndarray]) -> faiss.IndexFlatIP:
+#     matrix = np.stack(embeddings).astype("float32")
+#     index = faiss.IndexFlatIP(matrix.shape[1])  # inner product = cosine on normalized vectors
+#     index.add(matrix)
+#     return index
+#
+# def faiss_candidates(index, query_emb: np.ndarray, k: int = 50) -> list[int]:
+#     q = query_emb.astype("float32").reshape(1, -1)
+#     _, indices = index.search(q, k)
+#     return indices[0].tolist()
 
 
 if __name__ == "__main__":
